@@ -14548,12 +14548,7 @@ class TestAdvancedIndexing(TestCaseMPS):
 
         v = torch.tensor([True, False, True], dtype=torch.bool, device=device)
         boolIndices = torch.tensor([True, False, False], dtype=torch.bool, device=device)
-        uint8Indices = torch.tensor([1, 0, 0], dtype=torch.uint8, device=device)
-        with warnings.catch_warnings(record=True) as w:
-            self.assertEqual(v[boolIndices].shape, v[uint8Indices].shape)
-            self.assertEqual(v[boolIndices], v[uint8Indices])
-            self.assertEqual(v[boolIndices], torch.tensor([True], dtype=torch.bool, device=device))
-            self.assertEqual(len(w), 2)
+        self.assertEqual(v[boolIndices], torch.tensor([True], dtype=torch.bool, device=device))
 
     def test_bool_indices_accumulate(self, device="mps"):
         mask = torch.zeros(size=(10, ), dtype=torch.uint8, device=device)
@@ -14562,13 +14557,31 @@ class TestAdvancedIndexing(TestCaseMPS):
         y.index_put_((mask, ), y[mask], accumulate=True)
         self.assertEqual(y, torch.ones(size=(10, 10), device=device))
 
-    def test_byte_mask(self, device="mps"):
+    def test_uint8_index(self, device="mps"):
+        # Indexing with a uint8 tensor treats it as a mask, which is deprecated.
+        # See https://github.com/pytorch/pytorch/issues/201370
+        msg = "indexing with dtype torch.uint8 is now deprecated"
         v = torch.randn(5, 7, 3, device=device)
-        mask = torch.ByteTensor([1, 0, 1, 1, 0]).to(device)
-        with warnings.catch_warnings(record=True) as w:
-            self.assertEqual(v[mask].shape, (3, 7, 3))
-            self.assertEqual(v[mask], torch.stack([v[0], v[2], v[3]]))
-            self.assertEqual(len(w), 2)
+        mask = torch.tensor([1, 0, 1, 1, 0], dtype=torch.uint8, device=device)
+        with self.assertWarnsRegex(UserWarning, msg):
+            self.assertEqual(v[mask], v[mask.bool()])
+        b = torch.tensor([True, False, True], device=device)
+        with self.assertWarnsRegex(UserWarning, msg):
+            self.assertEqual(b[mask[:3]], b[mask[:3].bool()])
+        # the value broadcasts over the selected rows
+        x, y = torch.arange(16., device=device).view(4, 4), torch.arange(16., device=device).view(4, 4)
+        with self.assertWarnsRegex(UserWarning, msg):
+            x[mask[:4]] = x[0].clone()
+        y[mask[:4].bool()] = y[0].clone()
+        self.assertEqual(x, y)
+
+        # 0-dim uint8 indices are treated as bools, without a warning
+        scalar = torch.tensor(1, dtype=torch.uint8, device=device)
+        for t in (v, torch.tensor(1, device=device), torch.tensor(True, device=device)):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                self.assertEqual(t[scalar], t[scalar.bool()])
+            self.assertFalse(any(msg in str(warning.message) for warning in w))
 
         v = torch.tensor([1.], device=device)
         self.assertEqual(v[v == 0], torch.tensor([], device=device))
@@ -14833,14 +14846,12 @@ class TestAdvancedIndexing(TestCaseMPS):
             self.assertEqual(a.data_ptr(), a[None].data_ptr())
             self.assertEqual(a.data_ptr(), a[...].data_ptr())
 
-    def test_byte_tensor_assignment(self, device="mps"):
+    def test_bool_tensor_assignment(self, device="mps"):
         x = torch.arange(0., 16, device=device).view(4, 4)
-        b = torch.ByteTensor([True, False, True, False]).to(device)
+        b = torch.tensor([True, False, True, False], device=device)
         value = torch.tensor([3., 4., 5., 6.], device=device)
 
-        with warnings.catch_warnings(record=True) as w:
-            x[b] = value
-            self.assertEqual(len(w), 1)
+        x[b] = value
 
         self.assertEqual(x[0], value)
         self.assertEqual(x[1], torch.arange(4., 8, device=device))
