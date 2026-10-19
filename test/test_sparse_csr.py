@@ -1095,7 +1095,7 @@ def _npref_block_addmm_addmv(c, a, b, alpha, beta):
     return alpha * (a @ b) + beta * c
 
 
-class TestSparseCSRCPU(TestCase):
+class TestSparseCSRCpuOnly(TestCase):
     hw_classification = HardwareClassification.CPU
 
     @largeTensorTest("20GB", "cpu")
@@ -4452,7 +4452,7 @@ class TestSparseCompressedTritonKernels(TestCase):
 instantiate_parametrized_tests(TestSparseCompressed)
 instantiate_device_type_tests(TestSparseCompressedDevice, globals(), allow_xpu=True)
 
-instantiate_device_type_tests(TestSparseCSRCPU, globals(), only_for="cpu")
+instantiate_device_type_tests(TestSparseCSRCpuOnly, globals(), only_for="cpu")
 instantiate_device_type_tests(TestSparseCSRDevice, globals(), allow_xpu=True)
 instantiate_device_type_tests(TestSparseCSRCUDA, globals(), only_for="cuda")
 
