@@ -2,7 +2,6 @@
 
 import operator
 import random
-import warnings
 from functools import reduce
 from itertools import product
 
@@ -1023,18 +1022,12 @@ class TestIndexingDevice(TestCase):
         self.assertEqual(v[v == 0], torch.tensor([], device=device))
 
     def test_uint8_index(self, device):
-        # Indexing with a uint8 tensor treats it as a mask, which is deprecated.
+        # Indexing with a uint8 tensor used to treat it as a mask.
         # See https://github.com/pytorch/pytorch/issues/201370
-        msg = "indexing with dtype torch.uint8 is now deprecated"
+        msg = "indexing with dtype torch.uint8 is no longer supported"
 
         def u8(*values):
             return torch.tensor(values, dtype=torch.uint8, device=device)
-
-        def count_warnings(fn):
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                result = fn()
-            return result, sum(msg in str(warning.message) for warning in w)
 
         def setitem(t, index, value):
             t = t.clone()
@@ -1060,15 +1053,12 @@ class TestIndexingDevice(TestCase):
             (lambda f: v.index_put((f(mask * 0),), value[:0], accumulate=True), 1),
             (lambda f: torch.ops.aten.index(v, [f(mask)]), 1),
         ]
-        for fn, num_warnings in cases:
-            # a lambda rather than torch.Tensor.bool, which dynamo doesn't
-            # guard on, so it would reuse the bool graph for the uint8 run
-            expected = fn(lambda t: t.bool())
-            actual, count = count_warnings(lambda: fn(lambda t: t))
-            self.assertEqual(count, num_warnings)
-            self.assertEqual(actual, expected)
+        for fn, _ in cases:
+            with self.assertRaisesRegex(IndexError, msg):
+                fn(lambda t: t)
+        with self.assertRaisesRegex(IndexError, msg):
+            setitem(v, mask, 1.0)
 
-        # 0-dim uint8 indices are treated as bools, without a warning
         scalar = u8(1).squeeze()
         cases = [
             (t, index)
@@ -1082,11 +1072,10 @@ class TestIndexingDevice(TestCase):
         # a scalar index adds a dimension, which the next index skips
         cases.append((v, (scalar, 1)))
         for t, index in cases:
-            actual, count = count_warnings(lambda: t[index])
-            self.assertEqual(count, 0)
-            self.assertEqual(
-                actual, t[tuple(i.bool() if i is scalar else i for i in index)]
-            )
+            with self.assertRaisesRegex(IndexError, msg):
+                t[index]
+            with self.assertRaisesRegex(IndexError, msg):
+                setitem(t, index, 0)
 
     # MPS: Fails locally, but passes in CI...
     @skipIfTorchDynamo(

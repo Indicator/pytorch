@@ -14558,30 +14558,24 @@ class TestAdvancedIndexing(TestCaseMPS):
         self.assertEqual(y, torch.ones(size=(10, 10), device=device))
 
     def test_uint8_index(self, device="mps"):
-        # Indexing with a uint8 tensor treats it as a mask, which is deprecated.
+        # Indexing with a uint8 tensor used to treat it as a mask.
         # See https://github.com/pytorch/pytorch/issues/201370
-        msg = "indexing with dtype torch.uint8 is now deprecated"
+        msg = "indexing with dtype torch.uint8 is no longer supported"
         v = torch.randn(5, 7, 3, device=device)
         mask = torch.tensor([1, 0, 1, 1, 0], dtype=torch.uint8, device=device)
-        with self.assertWarnsRegex(UserWarning, msg):
-            self.assertEqual(v[mask], v[mask.bool()])
+        with self.assertRaisesRegex(IndexError, msg):
+            v[mask]
         b = torch.tensor([True, False, True], device=device)
-        with self.assertWarnsRegex(UserWarning, msg):
-            self.assertEqual(b[mask[:3]], b[mask[:3].bool()])
-        # the value broadcasts over the selected rows
-        x, y = torch.arange(16., device=device).view(4, 4), torch.arange(16., device=device).view(4, 4)
-        with self.assertWarnsRegex(UserWarning, msg):
+        with self.assertRaisesRegex(IndexError, msg):
+            b[mask[:3]]
+        x = torch.arange(16., device=device).view(4, 4)
+        with self.assertRaisesRegex(IndexError, msg):
             x[mask[:4]] = x[0].clone()
-        y[mask[:4].bool()] = y[0].clone()
-        self.assertEqual(x, y)
 
-        # 0-dim uint8 indices are treated as bools, without a warning
         scalar = torch.tensor(1, dtype=torch.uint8, device=device)
         for t in (v, torch.tensor(1, device=device), torch.tensor(True, device=device)):
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                self.assertEqual(t[scalar], t[scalar.bool()])
-            self.assertFalse(any(msg in str(warning.message) for warning in w))
+            with self.assertRaisesRegex(IndexError, msg):
+                t[scalar]
 
         v = torch.tensor([1.], device=device)
         self.assertEqual(v[v == 0], torch.tensor([], device=device))

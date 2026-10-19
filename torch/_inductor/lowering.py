@@ -5057,7 +5057,7 @@ def index_put_impl_(self, indices, values, accumulate, check, may_realize=False)
     if (
         values.get_numel() == 1
         and len(indices) == 1
-        and indices[0].get_dtype() in (torch.bool, torch.uint8)
+        and indices[0].get_dtype() == torch.bool
     ):
         mask = indices[0]
         for _ in range(len(mask.get_size()), len(self.get_size())):

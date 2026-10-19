@@ -244,7 +244,7 @@ TEST(TensorIndexingTest, TestEmptyBoolMask) {
 }
 
 TEST(TensorIndexingTest, TestByteIndex) {
-  // Indexing with a uint8 tensor treats it as a mask, which is deprecated.
+  // Indexing with a uint8 tensor used to treat it as a mask.
   // See https://github.com/pytorch/pytorch/issues/201370
   auto v = torch::randn({5, 7, 3});
   auto x = torch::arange(16.).view({4, 4});
@@ -252,20 +252,13 @@ TEST(TensorIndexingTest, TestByteIndex) {
   auto mask = torch::tensor({1, 0, 1, 1, 0}, torch::kByte);
   auto mask2 = torch::tensor({1, 1, 1}, torch::kByte);
   auto value = torch::randn({3, 7, 3});
-  // Each op passes its uint8 indices through f, so it can also be run with the
-  // bool equivalents.
+  // Each op passes its uint8 indices through f
   using ToIndex = std::function<torch::Tensor(const torch::Tensor&)>;
   auto check = [](const std::function<torch::Tensor(const ToIndex&)>& fn,
-                  int num_warnings) {
-    auto expected =
-        fn([](const torch::Tensor& t) { return t.to(torch::kBool); });
-    WarningCapture warnings;
-    assert_tensor_equal(fn([](const torch::Tensor& t) { return t; }), expected);
-    ASSERT_EQ(
-        count_substr_occurrences(
-            warnings.str(),
-            "indexing with dtype torch.uint8 is now deprecated"),
-        num_warnings);
+                  int /*num_uint8_indices*/) {
+    ASSERT_THROWS_WITH(
+        fn([](const torch::Tensor& t) { return t; }),
+        "indexing with dtype torch.uint8 is no longer supported");
   };
   check([&](const ToIndex& f) { return v.index({f(mask)}); }, 1);
   check(
@@ -302,26 +295,22 @@ TEST(TensorIndexingTest, TestByteIndex) {
 }
 
 static void testByteScalarIndex(torch::Device device) {
-  // 0-dim uint8 indices are treated as bools, without a warning
+  const char* msg = "indexing with dtype torch.uint8 is no longer supported";
   auto scalar =
       torch::tensor(1, torch::TensorOptions(torch::kByte).device(device));
-  auto bool_scalar = scalar.to(torch::kBool);
   for (const auto& t :
        {torch::randn({5, 7, 3}, device),
         torch::tensor(1, device),
         torch::tensor(
             true, torch::TensorOptions(torch::kBool).device(device))}) {
-    WarningCapture warnings;
-    assert_tensor_equal(t.index({scalar}), t.index({bool_scalar}));
-    assert_tensor_equal(
-        t.index({"...", scalar}), t.index({"...", bool_scalar}));
-    ASSERT_EQ(count_substr_occurrences(warnings.str(), "torch.uint8"), 0);
+    ASSERT_THROWS_WITH(t.index({scalar}), msg);
+    ASSERT_THROWS_WITH(t.index({"...", scalar}), msg);
+    ASSERT_THROWS_WITH(t.clone().index_put_({scalar}, 0), msg);
   }
   // a scalar index adds a dimension, which the next index skips
   auto v = torch::randn({5, 7, 3}, device);
-  WarningCapture warnings;
-  assert_tensor_equal(v.index({scalar, 1}), v.index({bool_scalar, 1}));
-  ASSERT_EQ(count_substr_occurrences(warnings.str(), "torch.uint8"), 0);
+  ASSERT_THROWS_WITH(v.index({scalar, 1}), msg);
+  ASSERT_THROWS_WITH(v.index_put_({scalar, 1}, 0), msg);
 }
 
 TEST(TensorIndexingTest, TestByteScalarIndex) {
