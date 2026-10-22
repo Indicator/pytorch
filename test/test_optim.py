@@ -1696,6 +1696,40 @@ class TestOptimRenewed(TestCase):
                 without_param_names(optimizer_c.state_dict())["param_groups"][-1],
             )
 
+    @skipMPS
+    @parametrize("fused", [False, True])
+    def test_load_state_dict_preserves_dtype(self, device, fused):
+        param = Parameter(torch.empty((), device=device, dtype=torch.bfloat16))
+        optimizer = torch.optim.Adam([param], fused=fused)
+        saved_state = {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.tensor(0.12345679),
+            "exp_avg_sq": torch.tensor(0.01234568),
+            "nested": [{"scalar": torch.tensor(0.23456789)}],
+            "history": (torch.ones(1, dtype=torch.int64),),
+        }
+        optimizer.state[param] = saved_state
+        optimizer.load_state_dict(optimizer.state_dict())
+        state = optimizer.state[param]
+
+        for key in ("exp_avg", "exp_avg_sq"):
+            self.assertEqual(state[key].dtype, torch.float32)
+            self.assertEqual(state[key].device, param.device)
+            self.assertEqual(state[key], saved_state[key])
+        scalar = state["nested"][0]["scalar"]
+        self.assertEqual(scalar.dtype, torch.float32)
+        self.assertEqual(scalar.device, param.device)
+        self.assertEqual(state["nested"], saved_state["nested"])
+        self.assertEqual(state["history"][0].dtype, torch.int64)
+        self.assertEqual(state["history"][0].device, param.device)
+        self.assertEqual(state["history"], saved_state["history"])
+        if fused:
+            self.assertEqual(state["step"].dtype, torch.float32)
+            self.assertEqual(state["step"].device, param.device)
+            self.assertEqual(state["step"].item(), 3.0)
+        else:
+            self.assertIs(state["step"], saved_state["step"])
+
     @optims(optim_db, dtypes=[torch.float32])
     def test_can_load_older_state_dict(self, device, dtype, optim_info):
         optim_cls = optim_info.optim_cls
@@ -2555,6 +2589,28 @@ class TestOptimRenewed(TestCase):
             self.assertEqual(state["exp_avg_sq"].dtype, torch.bfloat16)
             if amsgrad:
                 self.assertEqual(state["max_exp_avg_sq"].dtype, torch.bfloat16)
+
+    @onlyAccelerator
+    @skipMPS
+    def test_fused_mixed_precision_load_state_dict(self, device):
+        param = torch.rand(20, 7, device=device)
+        param.grad = torch.rand_like(param)
+        optimizer = torch.optim.AdamW([param], fused=True)
+        optimizer.register_step_pre_hook(_bf16_state_init_hook)
+        optimizer.step()
+
+        param_c = param.clone()
+        optimizer_c = torch.optim.AdamW([param_c], fused=True)
+        optimizer_c.load_state_dict(deepcopy(optimizer.state_dict()))
+        # The fused kernel picks its bf16-state path from the exp_avg dtype alone.
+        for key in ("exp_avg", "exp_avg_sq"):
+            self.assertEqual(optimizer_c.state[param_c][key].dtype, torch.bfloat16)
+
+        param.grad = torch.rand_like(param)
+        param_c.grad = param.grad.clone()
+        optimizer.step()
+        optimizer_c.step()
+        self.assertEqual(param, param_c, atol=0, rtol=0)
 
     @onlyAccelerator
     @skipMPS
