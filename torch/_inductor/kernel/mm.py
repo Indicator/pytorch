@@ -4,6 +4,8 @@ import logging
 from collections.abc import Sequence
 from typing import Any, cast, Literal
 
+import sympy
+
 import torch
 from torch._dynamo.utils import counters
 from torch._inductor.autoheuristic.autoheuristic import AutoHeuristicSelectAlgorithm
@@ -1988,6 +1990,24 @@ def tuned_scaled_mm(
         scale = L.to_dtype(folded_output_scale_real, layout.dtype)
         scale = L.expand(scale, node.get_size())
         return lowerings[aten.mul.Tensor](node, scale)
+
+    if (
+        mat_a.get_device().type == "cuda"
+        and bias is not None
+        and not V.graph.sizevars.guard_or_false(sympy.Eq(bias.get_numel(), n))
+    ):
+        return apply_folded_output_scale(
+            fallback_handler(aten._scaled_mm.default, add_to_fallback_set=False)(
+                mat_a,
+                mat_b,
+                scale_a,
+                scale_b,
+                bias,
+                None if folded_output_scale else scale_result,
+                out_dtype,
+                use_fast_accum,
+            )
+        )
 
     bias_real = realize_inputs(bias) if bias else None
 
