@@ -16,6 +16,7 @@
 #include <optional>
 #endif
 
+#include <ATen/cuda/tunable/GemmLdRules.h>
 #include <ATen/cuda/tunable/TunableOp.h>
 #include <ATen/cuda/tunable/Tunable.h>
 #include <ATen/cuda/CUDABlas.h>
@@ -113,16 +114,13 @@ inline std::string MaybeWildcardInt(int64_t value, bool wildcard) {
   return wildcard ? "*" : c10::str(value);
 }
 
-inline bool UsesMForLda(char transa) {
-  // lda is the leading dim of A. For non-transposed A (transa == 'N'), A is
-  // laid out with lda >= m, so lda tracks M; for transposed A (transa == 'T'),
-  // lda >= k, so lda tracks K. This mirrors GetSizeA's stride computation.
-  return transa == 'N' || transa == 'n';
-}
-
-inline bool UsesKForLdb(char transb) {
-  return transb == 'N' || transb == 'n';
-}
+// UsesMForLda, UsesKForLdb, GemmLeadingDims, LdMayVary, the
+// LdsCompatibleWhen*Varies pair and the signature parser/matcher
+// (SplitUnderscore/GemmShape/ParseGemmShape/NearestLargerMatch) live in
+// GemmLdRules.h so they can be unit tested without ATen or CUDA. What is shared
+// with ShouldWildcardLd* below is UsesMForLda/UsesKForLdb (which ld tracks which
+// dim) and the tightness principle; the call shapes differ because the inputs
+// differ (a single shape + dynamic mask here, two shapes in LdMayVary).
 
 // A leading dim is "tight" (equals its logical extent, no independent padding)
 // only when lda==m/k, ldb==k/n, ldc==m. Wildcard a leading dim only when it is
