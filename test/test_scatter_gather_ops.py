@@ -1346,11 +1346,11 @@ class TestScatterAddOverrideCorrectness(TestCase):
 
 @unittest.skipUnless(torch.version.hip is None and SM90OrLater, "requires NVIDIA sm_90+")
 @skipIfNoCuteDSL
-class TestIndexCopyOverride(TestCase):
+class TestIndexCopyScatterOverride(TestCase):
     hw_classification = HardwareClassification.CUDA
 
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
-    @parametrize("variant", ["functional", "inplace", "out"])
+    @parametrize("variant", ["functional", "inplace", "out", "scatter"])
     @parametrize("layout", ["contiguous", "padded", "transposed"])
     def test_dispatch(self, device, dtype, variant, layout):
         from torch._native.ops.scatter_add import vec_scatter_kernel
@@ -1374,6 +1374,10 @@ class TestIndexCopyOverride(TestCase):
             elif variant == "inplace":
                 result = dst.index_copy_(-dst.ndim, index, src)
                 self.assertIs(result, dst)
+            elif variant == "scatter":
+                expanded = index[:, None, None].expand_as(src)
+                result = dst.scatter_(-dst.ndim, expanded, src)
+                self.assertIs(result, dst)
             else:
                 out = torch.empty_strided(dst.shape, dst.stride(), device=device, dtype=dtype)
                 result = torch.index_copy(dst, 0, index, src, out=out)
@@ -1384,8 +1388,88 @@ class TestIndexCopyOverride(TestCase):
                 kernel.assert_called_once()
                 self.assertFalse(kernel.call_args.kwargs["accumulate"])
         self.assertEqual(result, expected, atol=0, rtol=0)
-        if variant != "inplace":
+        if variant not in ("inplace", "scatter"):
             self.assertEqual(dst, original)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("index_dtype", [torch.int32, torch.int64])
+    @parametrize("layout", ["last_dim", "partial_src", "partial_slice", "broadcast_src"])
+    def test_scatter_dispatch(self, device, dtype, index_dtype, layout):
+        from torch._native.ops.scatter_add import vec_scatter_kernel
+
+        dst = torch.full((64, 4, 64), float("nan"), device=device, dtype=dtype)
+        src = torch.randn((40, 4, 64), device=device, dtype=dtype)
+        index = torch.randperm(64, device=device, dtype=index_dtype)[:32]
+        index = index[:, None, None].expand(32, 4, 64)
+        if layout != "partial_src":
+            src = src[:32]
+        dim = 0
+        if layout == "last_dim":
+            dst, src, index = [t.movedim(0, -1) for t in (dst, src, index)]
+            dim = -1
+        elif layout == "partial_slice":
+            index = index[:, :2]
+        elif layout == "broadcast_src":
+            src = src[:1].expand_as(src)
+        expected = dst.cpu().scatter_(dim, index.cpu(), src.cpu())
+        with mock.patch.object(vec_scatter_kernel, "vec_scatter_add_into", wraps=vec_scatter_kernel.vec_scatter_add_into) as kernel:
+            self.assertIs(dst.scatter_(dim, index, src), dst)
+            kernel.assert_called_once()
+            self.assertFalse(kernel.call_args.kwargs["accumulate"])
+        self.assertEqual(dst, expected, atol=0, rtol=0)
+
+    @parametrize("case", [
+        "small_slice", "materialized_index", "inner_stride", "misaligned",
+        "misaligned_row", "empty_index", "deterministic",
+    ])
+    def test_scatter_fallback(self, device, case):
+        from torch._native.ops.scatter import cutedsl_impl
+        from torch._native.ops.scatter_add import vec_scatter_kernel
+
+        dst = torch.full((64, 128), float("nan"), device=device)
+        src = torch.randn((32, 128), device=device)
+        index = torch.arange(32, device=device)[:, None].expand_as(src)
+        if case == "small_slice":
+            dst, src, index = [t[:, :32] for t in (dst, src, index)]
+        elif case == "materialized_index":
+            index = index.contiguous()
+        elif case == "inner_stride":
+            dst, src, index = [t[:, ::2] for t in (dst, src, index)]
+        elif case == "misaligned":
+            dst = torch.full((64 * 128 + 1,), float("nan"), device=device)[1:].view(64, 128)
+        elif case == "misaligned_row":
+            dst = torch.full((64, 129), float("nan"), device=device)[:, :128]
+        elif case == "empty_index":
+            index = index[:0]
+        expected = dst.cpu().scatter_(0, index.cpu(), src.cpu())
+        with DeterministicGuard(case == "deterministic"):
+            self.assertFalse(cutedsl_impl._cond(dst, 0, index, src))
+            with mock.patch.object(vec_scatter_kernel, "vec_scatter_add_into", wraps=vec_scatter_kernel.vec_scatter_add_into) as kernel:
+                dst.scatter_(0, index, src)
+                kernel.assert_not_called()
+        self.assertEqual(dst, expected, atol=0, rtol=0)
+
+    @parametrize("case", ["src_shape", "dst_shape", "src_alias", "index_alias", "overlap"])
+    def test_scatter_declines_invalid_input(self, device, case):
+        from torch._native.ops.scatter import cutedsl_impl
+
+        dst = torch.zeros((64, 128), device=device)
+        src = torch.ones((32, 128), device=device)
+        index = torch.arange(32, device=device)[:, None].expand_as(src)
+        if case == "src_shape":
+            src = src[:16]
+        elif case == "dst_shape":
+            dst = dst[:, :64]
+        elif case == "src_alias":
+            src = dst[:32]
+        elif case == "index_alias":
+            index = dst.view(torch.int64).flatten()[:32, None].expand_as(src)
+        elif case == "overlap":
+            dst = dst[:1].expand_as(dst)
+        self.assertFalse(cutedsl_impl._cond(dst, 0, index, src))
+        if case != "index_alias":
+            with self.assertRaises(RuntimeError):
+                dst.scatter_(0, index, src)
 
     @parametrize("case", [
         "small_slice", "strided_index", "int32_index", "inner_stride",
@@ -1421,32 +1505,39 @@ class TestIndexCopyOverride(TestCase):
 
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("deterministic", [False, True])
-    def test_duplicates(self, device, dtype, deterministic):
+    @parametrize("op", ["index_copy_", "scatter_"])
+    def test_duplicates(self, device, dtype, deterministic, op):
         dst = torch.randn((64, 128), device=device, dtype=dtype)
         index = torch.arange(32, device=device).repeat(2)
         src = torch.randn((32, 128), device=device, dtype=dtype).repeat(2, 1)
         if deterministic:
             src[32:].add_(1)
         expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        if op == "scatter_":
+            index = index[:, None].expand_as(src)
         with DeterministicGuard(deterministic):
-            dst.index_copy_(0, index, src)
+            getattr(dst, op)(0, index, src)
         self.assertEqual(dst, expected, atol=0, rtol=0)
 
-    def test_cuda_graph(self, device):
+    @parametrize("op", ["index_copy_", "scatter_"])
+    def test_cuda_graph(self, device, op):
         dst = torch.zeros((64, 128), device=device)
         src = torch.randn((32, 128), device=device)
         index = torch.randperm(64, device=device)[:32]
         expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
-        dst.index_copy_(0, index, src)
+        if op == "scatter_":
+            index = index[:, None].expand_as(src)
+        copy_ = getattr(dst, op)
+        copy_(0, index, src)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            dst.index_copy_(0, index, src)
+            copy_(0, index, src)
         dst.zero_()
         graph.replay()
         self.assertEqual(dst, expected, atol=0, rtol=0)
 
-    @parametrize("inplace", [False, True])
-    def test_backward(self, device, inplace):
+    @parametrize("variant", ["functional", "inplace", "scatter"])
+    def test_backward(self, device, variant):
         dst = torch.randn((64, 128), device=device, requires_grad=True)
         src = torch.randn((32, 128), device=device, requires_grad=True)
         index = torch.randperm(64, device=device)[:32]
@@ -1454,14 +1545,16 @@ class TestIndexCopyOverride(TestCase):
         with torch.backends.python_native.cutedsl.disabled():
             ref = torch.index_copy(dst, 0, index, src)
             expected = torch.autograd.grad(ref, (dst, src), grad)
-        if inplace:
+        if variant == "inplace":
             result = dst.clone().index_copy_(0, index, src)
+        elif variant == "scatter":
+            result = dst.clone().scatter_(0, index[:, None].expand_as(src), src)
         else:
             result = torch.index_copy(dst, 0, index, src)
         self.assertEqual(torch.autograd.grad(result, (dst, src), grad), expected)
 
 
-instantiate_device_type_tests(TestIndexCopyOverride, globals(), only_for="cuda")
+instantiate_device_type_tests(TestIndexCopyScatterOverride, globals(), only_for="cuda")
 
 instantiate_parametrized_tests(TestScatterAddOverrideConds)
 instantiate_parametrized_tests(TestScatterAddOverrideCorrectness)

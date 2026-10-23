@@ -6,6 +6,7 @@ from . import (
     norm,
     polar,
     reductions,
+    scatter,
     scatter_add,
     topk,
 )
