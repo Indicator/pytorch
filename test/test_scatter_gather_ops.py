@@ -3,6 +3,7 @@
 import random
 import unittest
 from typing import NamedTuple
+from unittest import mock
 
 import torch
 
@@ -1342,6 +1343,125 @@ class TestScatterAddOverrideCorrectness(TestCase):
         self.assertEqual(got, ref, atol=tol, rtol=tol)
 
 
+
+@unittest.skipUnless(torch.version.hip is None and SM90OrLater, "requires NVIDIA sm_90+")
+@skipIfNoCuteDSL
+class TestIndexCopyOverride(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("variant", ["functional", "inplace", "out"])
+    @parametrize("layout", ["contiguous", "padded", "transposed"])
+    def test_dispatch(self, device, dtype, variant, layout):
+        from torch._native.ops.scatter_add import vec_scatter_kernel
+
+        width = 264
+        storage_width = width + (8 if layout == "padded" else 0)
+        dst = torch.full((64, storage_width), float("nan"), device=device, dtype=dtype)
+        dst = dst[:, :width].view(64, 4, 66)
+        src = torch.randn((32, storage_width), device=device, dtype=dtype)
+        src = src[:, :width].view(32, 4, 66)
+        if layout == "transposed":
+            dst, src = dst.transpose(1, 2), src.transpose(1, 2)
+        index = torch.randperm(64, device=device)[:32]
+        expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        original = dst.clone()
+
+        with mock.patch.object(vec_scatter_kernel, "vec_scatter_add_into", wraps=vec_scatter_kernel.vec_scatter_add_into) as kernel:
+            if variant == "functional":
+                result = torch.index_copy(dst, 0, index, src)
+                self.assertTrue(result.is_contiguous())
+            elif variant == "inplace":
+                result = dst.index_copy_(-dst.ndim, index, src)
+                self.assertIs(result, dst)
+            else:
+                out = torch.empty_strided(dst.shape, dst.stride(), device=device, dtype=dtype)
+                result = torch.index_copy(dst, 0, index, src, out=out)
+                self.assertIs(result, out)
+            if variant == "functional" and layout == "transposed":
+                kernel.assert_not_called()
+            else:
+                kernel.assert_called_once()
+                self.assertFalse(kernel.call_args.kwargs["accumulate"])
+        self.assertEqual(result, expected, atol=0, rtol=0)
+        if variant != "inplace":
+            self.assertEqual(dst, original)
+
+    @parametrize("case", [
+        "small_slice", "strided_index", "int32_index", "inner_stride",
+        "overlapping_rows", "alias", "shape", "dim", "deterministic", "misaligned",
+    ])
+    def test_declines(self, device, case):
+        from torch._native.ops.index_copy import cutedsl_impl
+
+        dst = torch.zeros((64, 128), device=device)
+        src = torch.ones((32, 128), device=device)
+        index = torch.arange(32, device=device)
+        dim = 0
+        if case == "small_slice":
+            dst, src = dst[:, :8], src[:, :8]
+        elif case == "strided_index":
+            index = torch.arange(64, device=device)[::2]
+        elif case == "int32_index":
+            index = index.int()
+        elif case == "inner_stride":
+            dst, src = dst[:, ::2], src[:, ::2]
+        elif case == "overlapping_rows":
+            dst = dst[:1].expand_as(dst)
+        elif case == "alias":
+            src = dst[:32]
+        elif case == "shape":
+            src = src[:, :64]
+        elif case == "dim":
+            dim = 1
+        elif case == "misaligned":
+            dst = torch.empty(64 * 128 + 1, device=device)[1:].view(64, 128)
+        with DeterministicGuard(case == "deterministic"):
+            self.assertFalse(cutedsl_impl._cond(dst, dim, index, src))
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("deterministic", [False, True])
+    def test_duplicates(self, device, dtype, deterministic):
+        dst = torch.randn((64, 128), device=device, dtype=dtype)
+        index = torch.arange(32, device=device).repeat(2)
+        src = torch.randn((32, 128), device=device, dtype=dtype).repeat(2, 1)
+        if deterministic:
+            src[32:].add_(1)
+        expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        with DeterministicGuard(deterministic):
+            dst.index_copy_(0, index, src)
+        self.assertEqual(dst, expected, atol=0, rtol=0)
+
+    def test_cuda_graph(self, device):
+        dst = torch.zeros((64, 128), device=device)
+        src = torch.randn((32, 128), device=device)
+        index = torch.randperm(64, device=device)[:32]
+        expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        dst.index_copy_(0, index, src)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dst.index_copy_(0, index, src)
+        dst.zero_()
+        graph.replay()
+        self.assertEqual(dst, expected, atol=0, rtol=0)
+
+    @parametrize("inplace", [False, True])
+    def test_backward(self, device, inplace):
+        dst = torch.randn((64, 128), device=device, requires_grad=True)
+        src = torch.randn((32, 128), device=device, requires_grad=True)
+        index = torch.randperm(64, device=device)[:32]
+        grad = torch.randn_like(dst)
+        with torch.backends.python_native.cutedsl.disabled():
+            ref = torch.index_copy(dst, 0, index, src)
+            expected = torch.autograd.grad(ref, (dst, src), grad)
+        if inplace:
+            result = dst.clone().index_copy_(0, index, src)
+        else:
+            result = torch.index_copy(dst, 0, index, src)
+        self.assertEqual(torch.autograd.grad(result, (dst, src), grad), expected)
+
+
+instantiate_device_type_tests(TestIndexCopyOverride, globals(), only_for="cuda")
 
 instantiate_parametrized_tests(TestScatterAddOverrideConds)
 instantiate_parametrized_tests(TestScatterAddOverrideCorrectness)

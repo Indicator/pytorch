@@ -73,7 +73,7 @@ def _atomic_add_bf16x2(ptr, val_a: BFloat16, val_b: BFloat16, *, loc=None, ip=No
     _packed_atomic_add_bf16x2(gmem_ptr_i64, packed, loc=loc, ip=ip)
 
 
-def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
+def _make_kernel(dtype, vec_elems: int, contig: bool, accumulate: bool):
     """Build a dtype-specialized vectorized scatter-add kernel.
 
     Each warp handles one source row. 32 lanes chunk through N, each lane
@@ -135,13 +135,19 @@ def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
                     # shape (vec_elems x elem_bytes == 16 bytes, so this
                     # becomes a single LDG.128).
                     gsrc = cute.make_tensor(
-                        mSrc.iterator + src_off,
+                        (mSrc.iterator + src_off).align(16),
                         cute.make_layout(vec_elems),
                     )
                     rvals = cute.make_rmem_tensor(vec_elems, dtype)
                     cute.autovec_copy(gsrc, rvals)
 
-                    if const_expr(is_half):
+                    if const_expr(not accumulate):
+                        gdst = cute.make_tensor(
+                            (mOut.iterator + dst_off).align(16),
+                            cute.make_layout(vec_elems),
+                        )
+                        cute.autovec_copy(rvals, gdst)
+                    elif const_expr(is_half):
                         # Paired atomics: one x2 atomic per 2 elements.
                         # vec_elems is even for halves (8 at 16 bytes),
                         # so vec_elems // 2 is exact.
@@ -191,27 +197,27 @@ def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
 
 
 @instrumented_cutedsl_cache(
-    "aten::scatter_add",
-    key_fn=lambda torch_dtype, contig: f"vec {torch_dtype} contig={contig}",
+    lambda dtype, contig, add=True: "aten::scatter_add" if add else "aten::index_copy",
+    key_fn=lambda dtype, contig, add=True: f"vec {dtype} {contig=} {add=}",
 )
-def _compile_vec_scatter(torch_dtype: torch.dtype, contig: bool):
+def _compile_vec_scatter(dtype: torch.dtype, contig: bool, add: bool = True):
     # N is a runtime arg (``D``), never a compile-time constant here: the
     # kernel loops ``while off < D`` and loads fixed ``vec_elems`` chunks off
     # a raw iterator, so the inner dim can stay symbolic. One compile per
     # (dtype, contig) serves every N.
-    dtype = _TORCH_TO_CUTE[torch_dtype]
-    elem_bytes = dtype.width // 8
+    cute_dtype = _TORCH_TO_CUTE[dtype]
+    elem_bytes = cute_dtype.width // 8
     vec_elems = _VEC_BYTES // elem_bytes
-    launcher = _make_kernel(dtype, elem_bytes, vec_elems, contig)
+    launcher = _make_kernel(cute_dtype, vec_elems, contig, add)
 
     mSrc_fake = cute.runtime.make_fake_tensor(
-        dtype, (cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1)
+        cute_dtype, (cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1)
     )
     # Index is contiguous (see _flatten_for_expanded_1d); fix stride=1
     # so `mIndex[i]` doesn't emit a runtime stride multiply.
     mIndex_fake = cute.runtime.make_fake_tensor(Int64, (cute.sym_int(),), stride=(1,))
     mOut_fake = cute.runtime.make_fake_tensor(
-        dtype, (cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1)
+        cute_dtype, (cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1)
     )
     return cute.compile(
         launcher,
@@ -242,8 +248,13 @@ def vec_scatter_add_into(
     out: torch.Tensor,
     index_1d: torch.Tensor,
     src: torch.Tensor,
+    *,
+    accumulate: bool = True,
 ) -> None:
-    """In-place: ``out[index_1d[i], :] += src[i, :]`` for every i.
+    r"""In-place: ``out[index_1d[i], :] += src[i, :]`` for every i.
+
+    With ``accumulate=False``, overwrite the selected rows instead; output rows
+    must then be 16-byte aligned for the vector stores.
 
     ``out`` / ``src`` are 2D with inner-dim stride 1; outer row stride
     can differ from N. Requires N divisible by ``vec_elems_for(src.dtype)``
@@ -252,7 +263,7 @@ def vec_scatter_add_into(
     """
     M, N = src.shape
     contig = src.stride(0) == N and out.stride(0) == N
-    compiled = _compile_vec_scatter(src.dtype, contig)
+    compiled = _compile_vec_scatter(src.dtype, contig, accumulate)
     sm = torch.cuda.get_device_properties(out.device).multi_processor_count
     grid = min((M + _WARPS_PER_BLOCK - 1) // _WARPS_PER_BLOCK, sm * 8)
     compiled(src, index_1d, out, M, N, grid, src.stride(0), out.stride(0))
