@@ -51,6 +51,18 @@ class _MutableAllowTf32Interface(DeviceInterface):
         return True
 
 
+class _MutableConvAllowTf32Interface(DeviceInterface):
+    enabled = False
+
+    @staticmethod
+    def conv_allow_tf32() -> bool:
+        return _MutableConvAllowTf32Interface.enabled
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+
 class _AllowTf32Interface(DeviceInterface):
     @staticmethod
     def allow_tf32() -> bool:
@@ -74,6 +86,16 @@ class TestAllowTf32Interface(TestCase):
             self.assertFalse(CudaInterface.allow_tf32())
         finally:
             torch.backends.cuda.matmul.fp32_precision = orig
+
+    def test_device_interface_conv_default_follows_cudnn_precision(self):
+        state = torch._C._get_cudnn_tf32_state()
+        try:
+            torch._C._set_fp32_precision_setter("cuda", "all", "tf32")
+            self.assertTrue(DeviceInterface.conv_allow_tf32())
+            torch._C._set_fp32_precision_setter("cuda", "all", "ieee")
+            self.assertFalse(DeviceInterface.conv_allow_tf32())
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
 
     def test_xpu_allow_tf32_matches_mkldnn(self):
         # Without USE_XPU the raw flag is None. The interface still returns a bool.
@@ -201,6 +223,26 @@ class TestAllowTf32ExtraKwargs(TestCase):
             torch.backends.cuda.matmul.fp32_precision = orig
         self.assertIn(("cuda", True), enabled.mm_template_allow_tf32)
         self.assertIn(("cuda", False), disabled.mm_template_allow_tf32)
+
+    def test_conv_flag_changes_fx_graph_cache_key(self):
+        get_interface_for_device("cpu")
+        previous = device_interfaces["cpu"]
+        gm = make_fx(lambda x: x * 2)(torch.zeros(2, 2))
+        example = [torch.zeros(2, 2)]
+        try:
+            register_interface_for_device("cpu", _MutableConvAllowTf32Interface)
+            _MutableConvAllowTf32Interface.enabled = True
+            enabled = FxGraphHashDetails(gm, example, {}, [])
+            enabled_key, _ = compiled_fx_graph_hash(gm, example, {}, [])
+            _MutableConvAllowTf32Interface.enabled = False
+            disabled = FxGraphHashDetails(gm, example, {}, [])
+            disabled_key, _ = compiled_fx_graph_hash(gm, example, {}, [])
+            self.assertEqual(enabled.conv_template_allow_tf32, (("cpu", True),))
+            self.assertEqual(disabled.conv_template_allow_tf32, (("cpu", False),))
+            self.assertNotEqual(enabled_key, disabled_key)
+        finally:
+            _MutableConvAllowTf32Interface.enabled = False
+            register_interface_for_device("cpu", previous)
 
     def test_non_cuda_flag_changes_fx_graph_cache_key(self):
         # cuda_matmul_settings already hashes CUDA fp32_precision. This swaps

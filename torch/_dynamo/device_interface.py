@@ -226,6 +226,18 @@ class DeviceInterface:
         """
         return False
 
+    @staticmethod
+    def conv_allow_tf32() -> bool:
+        """Whether the backend permits forward conv templates to set ALLOW_TF32.
+
+        The backward templates still read torch.backends.cudnn.allow_tf32. The
+        default reads the cuDNN-wide fp32 precision only because the forward
+        templates read it on every device before this hook existed. Dynamo's
+        global state guard covers only the CUDA conv and cuDNN-wide precisions,
+        so an override that reads another setting also needs a guard on it.
+        """
+        return torch.backends.cudnn.fp32_precision == "tf32"
+
     @classmethod
     def get_multi_processor_count(cls, device: torch.types.Device = None) -> int:
         """Return the number of compute units, used for occupancy /

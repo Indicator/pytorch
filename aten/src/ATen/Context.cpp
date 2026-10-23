@@ -274,6 +274,32 @@ void Context::setAllowTF32CuDNN(bool b) {
   allow_tf32_cudnn = b;
 }
 
+Context::CuDNNTF32State Context::cudnnTF32State() const {
+  return {
+      fp32_precision.at({Float32Backend::CUDA, Float32Op::ALL}),
+      fp32_precision.at({Float32Backend::CUDA, Float32Op::CONV}),
+      fp32_precision.at({Float32Backend::CUDA, Float32Op::RNN}),
+      allow_tf32_cudnn};
+}
+
+void Context::setCuDNNTF32State(const CuDNNTF32State& state) {
+  // The values a snapshot can hold: the CUDA-wide entry is never DEFAULT, and
+  // CUDA takes neither BF16 nor, outside matmul, BF16X9.
+  const auto valid = [](Float32Precision p, bool may_be_default) {
+    return p == Float32Precision::NONE || p == Float32Precision::IEEE ||
+        p == Float32Precision::TF32 ||
+        (may_be_default && p == Float32Precision::DEFAULT);
+  };
+  TORCH_CHECK(
+      valid(state.cuda_all, false) && valid(state.conv, true) &&
+          valid(state.rnn, true),
+      "Invalid cuDNN TF32 state");
+  fp32_precision.at({Float32Backend::CUDA, Float32Op::ALL}) = state.cuda_all;
+  fp32_precision.at({Float32Backend::CUDA, Float32Op::CONV}) = state.conv;
+  fp32_precision.at({Float32Backend::CUDA, Float32Op::RNN}) = state.rnn;
+  allow_tf32_cudnn = state.allow_tf32;
+}
+
 void Context::setSDPPriorityOrder(const std::vector<int64_t>& order) {
   // TODO*eqy): should it always be the number of backends - 1 (override backend excluded?)
   TORCH_CHECK(at::num_sdp_backends == sdp_priority_order.size(),

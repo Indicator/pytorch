@@ -3373,6 +3373,40 @@ Call this whenever a new thread is created in order to propagate values from
         return precision;
       });
 
+  // Precision names, plus "default" for the internal sentinel that conv and RNN
+  // start at, which only this snapshot carries.
+  const auto state_precision2str = [](at::Float32Precision p) {
+    return p == at::Float32Precision::DEFAULT ? std::string("default")
+                                              : at::precision2str(p);
+  };
+  const auto state_str2precision = [](const std::string& name) {
+    return name == "default" ? at::Float32Precision::DEFAULT
+                             : at::str2precision(name);
+  };
+
+  py_module.def("_get_cudnn_tf32_state", [state_precision2str]() {
+    const auto state = at::globalContext().cudnnTF32State();
+    return std::make_tuple(
+        state_precision2str(state.cuda_all),
+        state_precision2str(state.conv),
+        state_precision2str(state.rnn),
+        state.allow_tf32);
+  });
+
+  py_module.def(
+      "_set_cudnn_tf32_state",
+      [state_str2precision](
+          const std::string& cuda_all,
+          const std::string& conv,
+          const std::string& rnn,
+          bool allow_tf32) {
+        at::globalContext().setCuDNNTF32State(
+            {state_str2precision(cuda_all),
+             state_str2precision(conv),
+             state_str2precision(rnn),
+             allow_tf32});
+      });
+
   py_module.def(
       "_stash_obj_in_tls", [](const std::string& key, py::handle arg) {
         Py_INCREF(arg.ptr());

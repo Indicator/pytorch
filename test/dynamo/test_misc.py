@@ -5558,6 +5558,100 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         result = torch.compile(fn, backend="eager", fullgraph=True)(x, config)
         self.assertEqual(result, correct)
 
+    def test_cuda_conv_precision_change_recompiles(self):
+        # Restored exactly, so the conv precision keeps its internal default.
+        state = torch._C._get_cudnn_tf32_state()
+        try:
+            self._check_cuda_conv_precision_recompiles()
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+
+    def _check_cuda_conv_precision_recompiles(self):
+        # Inductor's conv templates can follow this precision, so a graph compiled
+        # under one setting must not be reused under another.
+        cnt = CompileCounter()
+
+        @torch.compile(backend=cnt)
+        def f(x):
+            return x + 1
+
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        f(torch.randn(3))
+        f(torch.randn(3))
+        self.assertEqual(cnt.frame_count, 1)
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        f(torch.randn(3))
+        self.assertEqual(cnt.frame_count, 2)
+        # Off CUDA the templates read the cuDNN-wide precision instead.
+        state = torch._C._get_cudnn_tf32_state()
+        # The CUDA-wide entry also feeds the matmul precision, which tracing then
+        # restores as an explicit value.
+        matmul = torch._C._get_fp32_precision_getter("cuda", "matmul")
+        guards = torch._C._dynamo.guards.GlobalStateGuard()
+        try:
+            torch._C._set_fp32_precision_setter("cuda", "all", "tf32")
+            reason = guards.reason().split()
+            self.assertIn("cudnn_fp32_precision", reason)
+            self.assertNotIn("cuda_conv_precision", reason)
+            f(torch.randn(3))
+            self.assertEqual(cnt.frame_count, 3)
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+            torch._C._set_fp32_precision_setter("cuda", "matmul", matmul)
+
+        # A payload written before these were recorded still loads.
+        guards = torch._C._dynamo.guards.GlobalStateGuard()
+        payload = json.loads(guards.__getstate__())
+        payload.pop("cuda_conv_precision")
+        payload.pop("cudnn_fp32_precision")
+        guards.__setstate__(json.dumps(payload))
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        self.assertTrue(guards.check())
+
+    def test_traced_cudnn_tf32_setter_is_undone_exactly(self):
+        # Tracing runs torch._C._set_cudnn_allow_tf32 for real. This backend drops
+        # the call from the graph, so only tracing changes the settings, and they
+        # must come back exactly: the conv and RNN precisions at their internal
+        # default, which follows the cuDNN-wide one, and the legacy flag.
+        original = torch._C._get_cudnn_tf32_state()
+        before = ("none", "default", "default", True)
+
+        def drop_setter(gm, example_inputs):
+            for node in list(gm.graph.nodes):
+                if node.target is torch._C._set_cudnn_allow_tf32:
+                    gm.graph.erase_node(node)
+            gm.recompile()
+            return gm.forward
+
+        @torch.compile(backend=drop_setter)
+        def g(x):
+            torch._C._set_cudnn_allow_tf32(False)
+            return x + 1
+
+        try:
+            torch._C._set_cudnn_tf32_state(*before)
+            g(torch.randn(3))
+            self.assertEqual(torch._C._get_cudnn_tf32_state(), before)
+            self.assertTrue(torch._C._get_cudnn_allow_tf32())
+            torch._C._set_fp32_precision_setter("cuda", "all", "ieee")
+            self.assertEqual(torch.backends.cudnn.conv.fp32_precision, "ieee")
+
+            # A snapshot only holds values the settings can take: the cuDNN-wide
+            # entry is never at the default, and CUDA takes no bf16.
+            torch._C._set_cudnn_tf32_state(*before)
+            for bad in (
+                ("default", "default", "default", True),
+                ("bf16", "default", "default", True),
+                ("none", "bf16", "default", True),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Invalid cuDNN TF32 state"):
+                    torch._C._set_cudnn_tf32_state(*bad)
+            with self.assertRaisesRegex(RuntimeError, "Unknown precision"):
+                torch._C._set_cudnn_tf32_state("bogus", "default", "default", True)
+            self.assertEqual(torch._C._get_cudnn_tf32_state(), before)
+        finally:
+            torch._C._set_cudnn_tf32_state(*original)
+
     @recover_orig_fp32_precision
     def test_global_state_guard_serialization(self):
         GlobalStateGuard = torch._C._dynamo.guards.GlobalStateGuard

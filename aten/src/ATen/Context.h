@@ -399,6 +399,17 @@ class TORCH_API Context {
       Float32Precision p);
   bool allowTF32CuDNN(std::optional<Float32Op> op = std::nullopt) const;
   void setAllowTF32CuDNN(bool /*b*/);
+  // The cuDNN TF32 settings exactly as stored: the CUDA-wide, convolution and
+  // RNN precisions (an op still at its internal default keeps it) and the
+  // legacy flag, so code that must undo a change can restore them as they were.
+  struct CuDNNTF32State {
+    Float32Precision cuda_all;
+    Float32Precision conv;
+    Float32Precision rnn;
+    bool allow_tf32;
+  };
+  CuDNNTF32State cudnnTF32State() const;
+  void setCuDNNTF32State(const CuDNNTF32State& state);
   bool allowTF32OneDNN() const;
   void setAllowTF32OneDNN(bool /*b*/);
   bool allowTF32CuBLAS() const;

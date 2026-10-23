@@ -362,6 +362,7 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             cuda_matmul_fp32_prec = torch._C._get_fp32_precision_getter(
                 "cuda", "matmul"
             )
+            cudnn_tf32_state = torch._C._get_cudnn_tf32_state()
             prior_fwd_from_src = torch.fx.graph_module._forward_from_src
             torch.fx.graph_module._forward_from_src = fx_forward_from_src_skip_result
             cleanup = setup_compile_debug()
@@ -393,6 +394,10 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                 torch._C._set_fp32_precision_setter(
                     "cuda", "matmul", cuda_matmul_fp32_prec
                 )
+                # Traced code can run torch._C._set_cudnn_allow_tf32 for real. Restore
+                # the stored values, so a convolution precision still at its default
+                # keeps following the CUDA-wide one.
+                torch._C._set_cudnn_tf32_state(*cudnn_tf32_state)
                 torch.fx.graph_module._forward_from_src = prior_fwd_from_src
                 if not guards.check():
                     raise AssertionError(
