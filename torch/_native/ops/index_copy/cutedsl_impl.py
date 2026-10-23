@@ -4,7 +4,6 @@ import torch
 
 from ... import cutedsl_utils as cu
 from ..scatter_add.cutedsl_impl import (
-    _alignment_contract_ok,
     _base_cond_ok,
     _is_vec_scatter_supported,
     _prepare_kernel_inputs,
@@ -37,10 +36,8 @@ def _cond(self, dim, index, source, *, out=None, functional=False):
         return False
     if torch._C._overlaps(dst, source) or torch._C._overlaps(dst, index):
         return False
-    if not _alignment_contract_ok(dst, source, 0, dst_ptr_align=16):
-        return False
     expanded = index.view(-1, *([1] * (source.ndim - 1))).expand_as(source)
-    return _is_vec_scatter_supported(dst, 0, expanded, source)
+    return _is_vec_scatter_supported(dst, 0, expanded, source, accumulate=False)
 
 
 def _inplace_impl(self, dim, index, source):

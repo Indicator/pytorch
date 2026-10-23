@@ -160,6 +160,10 @@ def _scatter_add_eligibility(
 
     if it.ndim != 2:
         return None
+    # Both kernels use int32 shapes and loop counters. Bounding the two-axis
+    # iteration also leaves headroom for the final loop increments.
+    if it.numel >= 2**31 or self.size(d) >= 2**31:
+        return None
     elem = self.element_size()
     if it.shape[0] * elem < _MIN_SLICE_BYTES:
         return None
@@ -234,17 +238,24 @@ def _is_tma_supported(
 
 
 def _is_vec_scatter_supported(
-    self: torch.Tensor, dim: int, index: torch.Tensor, src: torch.Tensor
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    src: torch.Tensor,
+    *,
+    accumulate: bool = True,
 ) -> bool:
     # ``red.global.add.noftz.bf16x2`` requires sm_90+. fp16x2 (sm_70+) and
     # scalar fp32 atomicAdd (sm_60+) work everywhere we care about.
-    if self.dtype is torch.bfloat16 and not _has_sm90_plus():
+    if accumulate and self.dtype is torch.bfloat16 and not _has_sm90_plus():
         return False
     d = _normalize_dim(dim, self.ndim)
     it = _scatter_add_eligibility(self, d, index, src)
     if it is None:
         return False
-    if not _alignment_contract_ok(self, src, d, dst_ptr_align=_VEC_DST_ALIGN_BYTES):
+    # Copy uses 16-byte vector stores instead of 4-byte atomics.
+    dst_align = _VEC_DST_ALIGN_BYTES if accumulate else 16
+    if not _alignment_contract_ok(self, src, d, dst_ptr_align=dst_align):
         return False
     # Each lane owns vec_elems consecutive elements; loop is either
     # fully in-bounds or fully skipped per lane. Only requirement is

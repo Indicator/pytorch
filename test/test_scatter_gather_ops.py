@@ -1344,7 +1344,7 @@ class TestScatterAddOverrideCorrectness(TestCase):
 
 
 
-@unittest.skipUnless(torch.version.hip is None and SM90OrLater, "requires NVIDIA sm_90+")
+@unittest.skipUnless(torch.version.hip is None and SM80OrLater, "requires NVIDIA sm_80+")
 @skipIfNoCuteDSL
 class TestIndexCopyScatterOverride(TestCase):
     hw_classification = HardwareClassification.CUDA
@@ -1390,6 +1390,66 @@ class TestIndexCopyScatterOverride(TestCase):
         self.assertEqual(result, expected, atol=0, rtol=0)
         if variant not in ("inplace", "scatter"):
             self.assertEqual(dst, original)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("case", ["offset", "row_stride"])
+    def test_index_copy_out_alignment_fallback(self, device, dtype, case):
+        from torch._native.ops.index_copy import cutedsl_impl
+        from torch._native.ops.scatter_add import vec_scatter_kernel
+
+        dst = torch.randn((64, 128), device=device, dtype=dtype)
+        src = torch.randn((32, 128), device=device, dtype=dtype)
+        index = torch.randperm(64, device=device)[:32]
+        if case == "offset":
+            out = torch.empty(64 * 128 + 1, device=device, dtype=dtype)[1:].view(64, 128)
+        else:
+            out = torch.empty((64, 129), device=device, dtype=dtype)[:, :128]
+        expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        original = dst.clone()
+        self.assertTrue(cutedsl_impl._cond(dst, 0, index, src))
+        self.assertFalse(cutedsl_impl._cond(dst, 0, index, src, out=out))
+        with mock.patch.object(vec_scatter_kernel, "vec_scatter_add_into", wraps=vec_scatter_kernel.vec_scatter_add_into) as kernel:
+            self.assertIs(torch.index_copy(dst, 0, index, src, out=out), out)
+            kernel.assert_not_called()
+        self.assertEqual(out, expected, atol=0, rtol=0)
+        self.assertEqual(dst, original)
+
+    @parametrize("case", ["source_alias", "index_alias", "dtype", "shape"])
+    def test_index_copy_out_declines(self, device, case):
+        from torch._native.ops.index_copy import cutedsl_impl
+
+        dst = torch.zeros((64, 128), device=device)
+        src = torch.ones((32, 128), device=device)
+        index = torch.arange(32, device=device)
+        out = torch.empty_like(dst)
+        if case == "source_alias":
+            src = out[:32]
+        elif case == "index_alias":
+            index = out.view(torch.int64).flatten()[:32]
+        elif case == "dtype":
+            out = out.double()
+        elif case == "shape":
+            out = out[:32]
+        self.assertTrue(cutedsl_impl._cond(dst, 0, index, src))
+        self.assertFalse(cutedsl_impl._cond(dst, 0, index, src, out=out))
+
+    @parametrize("sm90", [False, True])
+    @parametrize("op", ["index_copy_", "scatter_"])
+    def test_bfloat16_architecture(self, device, sm90, op):
+        from torch._native.ops.scatter_add import cutedsl_impl, vec_scatter_kernel
+
+        dst = torch.zeros((64, 128), device=device, dtype=torch.bfloat16)
+        src = torch.randn((32, 128), device=device, dtype=torch.bfloat16)
+        index = torch.randperm(64, device=device)[:32]
+        expanded = index[:, None].expand_as(src)
+        expected = dst.cpu().index_copy(0, index.cpu(), src.cpu())
+        with mock.patch.object(cutedsl_impl, "_has_sm90_plus", return_value=sm90):
+            self.assertEqual(cutedsl_impl._is_vec_scatter_supported(dst, 0, expanded, src), sm90)
+            with mock.patch.object(vec_scatter_kernel, "vec_scatter_add_into", wraps=vec_scatter_kernel.vec_scatter_add_into) as kernel:
+                getattr(dst, op)(0, index if op == "index_copy_" else expanded, src)
+                kernel.assert_called_once()
+                self.assertFalse(kernel.call_args.kwargs["accumulate"])
+        self.assertEqual(dst, expected, atol=0, rtol=0)
 
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("index_dtype", [torch.int32, torch.int64])
@@ -1468,7 +1528,8 @@ class TestIndexCopyScatterOverride(TestCase):
             dst = dst[:1].expand_as(dst)
         self.assertFalse(cutedsl_impl._cond(dst, 0, index, src))
         if case != "index_alias":
-            with self.assertRaises(RuntimeError):
+            error = "Expected index" if case in ("src_shape", "dst_shape") else "single memory location"
+            with self.assertRaisesRegex(RuntimeError, error):
                 dst.scatter_(0, index, src)
 
     @parametrize("case", [
@@ -1555,6 +1616,29 @@ class TestIndexCopyScatterOverride(TestCase):
 
 
 instantiate_device_type_tests(TestIndexCopyScatterOverride, globals(), only_for="cuda")
+
+
+class TestScatterIteratorLimits(TestCase):
+    @parametrize("rows,width,out_rows,expected", [
+        (2, 2**30 - 128, 2, True),
+        (2, 2**30, 2, False),
+        (2, 2**31 - 8, 2, False),
+        (2, 2**31, 2, False),
+        (2**24 - 1, 128, 2, True),
+        (2**24, 128, 2, False),
+        (2, 128, 2**31 - 1, True),
+        (2, 128, 2**31, False),
+    ])
+    def test_eligibility(self, rows, width, out_rows, expected):
+        from torch._native.ops.scatter_add.cutedsl_impl import _scatter_add_eligibility
+
+        dst = torch.empty((out_rows, width), device="meta")
+        src = torch.empty((rows, width), device="meta")
+        index = torch.empty(rows, device="meta", dtype=torch.int64)[:, None].expand_as(src)
+        self.assertEqual(_scatter_add_eligibility(dst, 0, index, src) is not None, expected)
+
+
+instantiate_parametrized_tests(TestScatterIteratorLimits)
 
 instantiate_parametrized_tests(TestScatterAddOverrideConds)
 instantiate_parametrized_tests(TestScatterAddOverrideCorrectness)
