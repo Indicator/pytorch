@@ -1789,6 +1789,59 @@ class TestMaxAutotune(TestCase):
 
         self.assertIn("NoValidChoicesError", str(context.exception))
 
+    @skipIfRocm
+    @skipIfXpu(msg="Eager XPU convolutions follow their own precision setting")
+    @parametrize("fp32_precision", ("ieee", "tf32"))
+    @parametrize("ndim", (2, 3))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_conv_fp32_precision(self, fp32_precision, ndim):
+        # Eager convolutions read the convolution's own setting, which is TF32 by
+        # default while the cuDNN-wide setting stays "none".
+        conv = torch.nn.functional.conv2d if ndim == 2 else torch.nn.functional.conv3d
+        spatial = (16, 16) if ndim == 2 else (8, 8, 8)
+        x = torch.randint(-2, 3, (2, 32, *spatial), device=GPU_TYPE).float()
+        w = torch.randint(-2, 3, (32, 32, *(3,) * ndim), device=GPU_TYPE).float()
+        state = torch._C._get_cudnn_tf32_state()
+        torch.backends.cudnn.conv.fp32_precision = fp32_precision
+        try:
+            actual, code = run_and_get_code(torch.compile(conv), x, w)
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+        # Small integers are exact in both TF32 and IEEE fp32.
+        self.assertEqual(actual, conv(x, w), atol=0, rtol=0)
+        # Triton templates never use TF32 on a GPU that has none.
+        expect_tf32 = fp32_precision == "tf32" and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+
+    @skipIfRocm
+    @skipIfXpu(msg="Eager XPU convolutions follow their own precision setting")
+    @parametrize("with_bias", (False, True))
+    @config.patch(max_autotune=True)
+    def test_explicit_ieee_convolution_runs_as_itself(self, with_bias):
+        def conv(x, w, b):
+            return torch._convolution(
+                x, w, b, [1, 1], [0, 0], [1, 1], False, [0, 0], 1,
+                False, False, True, False,
+            )  # fmt: skip
+
+        x = torch.randint(-2, 3, (2, 32, 16, 16), device=GPU_TYPE).float()
+        w = torch.randint(-2, 3, (32, 32, 3, 3), device=GPU_TYPE).float()
+        b = torch.randint(-2, 3, (32,), device=GPU_TYPE).float() if with_bias else None
+        state = torch._C._get_cudnn_tf32_state()
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        try:
+            actual, code = run_and_get_code(torch.compile(conv), x, w, b)
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+        self.assertEqual(actual, conv(x, w, b), atol=0, rtol=0)
+        # No conv choice of Inductor's, all of which would use TF32 here.
+        self.assertIn("aten._convolution.default(", code[0])
+        self.assertNotIn("ALLOW_TF32 : tl.constexpr = True", code[0])
+
     def test_non_contiguous_input_mm(self):
         """
         Make sure the triton template can work with non-contiguous inputs without crash.

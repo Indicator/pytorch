@@ -807,6 +807,24 @@ def _convolution(
     cudnn_enabled,
     allow_tf32,
 ):
+    if not allow_tf32 and conv_template_allow_tf32(ir.get_device_type(x)):
+        # Inductor's conv choices would use TF32 here, so a call that asks for IEEE
+        # runs as itself.
+        return fallback_handler(aten._convolution.default, add_to_fallback_set=False)(
+            x,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+            benchmark,
+            deterministic,
+            cudnn_enabled,
+            allow_tf32,
+        )
     return convolution(
         x, weight, bias, stride, padding, dilation, transposed, output_padding, groups
     )

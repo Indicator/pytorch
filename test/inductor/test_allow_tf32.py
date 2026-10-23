@@ -17,6 +17,7 @@ from torch._inductor.heuristics.template.triton import MMTemplateConfigMixin
 from torch._inductor.ir import Buffer, FixedLayout
 from torch._inductor.kernel_inputs import MMKernelInputs
 from torch._inductor.test_case import run_tests, TestCase
+from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -94,6 +95,19 @@ class TestAllowTf32Interface(TestCase):
             self.assertTrue(DeviceInterface.conv_allow_tf32())
             torch._C._set_fp32_precision_setter("cuda", "all", "ieee")
             self.assertFalse(DeviceInterface.conv_allow_tf32())
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+
+    @unittest.skipIf(torch.version.hip is not None, "ROCm keeps the cuDNN-wide flag")
+    def test_cuda_conv_allow_tf32_follows_conv_precision(self):
+        # Eager CUDA convolutions use TF32 by default while the cuDNN-wide
+        # precision stays "none"; conv templates follow the convolution's own.
+        state = torch._C._get_cudnn_tf32_state()
+        try:
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+            self.assertTrue(CudaInterface.conv_allow_tf32())
+            torch.backends.cudnn.conv.fp32_precision = "ieee"
+            self.assertFalse(CudaInterface.conv_allow_tf32())
         finally:
             torch._C._set_cudnn_tf32_state(*state)
 
@@ -224,6 +238,21 @@ class TestAllowTf32ExtraKwargs(TestCase):
         self.assertIn(("cuda", True), enabled.mm_template_allow_tf32)
         self.assertIn(("cuda", False), disabled.mm_template_allow_tf32)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    def test_cache_key_tracks_cuda_conv_allow_tf32(self):
+        tensor = torch.zeros(2, 2, device="cuda")
+        state = torch._C._get_cudnn_tf32_state()
+        try:
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+            enabled = FxGraphHashDetails(None, [tensor], {}, [])
+            torch.backends.cudnn.conv.fp32_precision = "ieee"
+            disabled = FxGraphHashDetails(None, [tensor], {}, [])
+        finally:
+            torch._C._set_cudnn_tf32_state(*state)
+        expected = torch.version.hip is None
+        self.assertIn(("cuda", expected), enabled.conv_template_allow_tf32)
+        self.assertIn(("cuda", False), disabled.conv_template_allow_tf32)
+
     def test_conv_flag_changes_fx_graph_cache_key(self):
         get_interface_for_device("cpu")
         previous = device_interfaces["cpu"]
@@ -240,6 +269,27 @@ class TestAllowTf32ExtraKwargs(TestCase):
             self.assertEqual(enabled.conv_template_allow_tf32, (("cpu", True),))
             self.assertEqual(disabled.conv_template_allow_tf32, (("cpu", False),))
             self.assertNotEqual(enabled_key, disabled_key)
+        finally:
+            _MutableConvAllowTf32Interface.enabled = False
+            register_interface_for_device("cpu", previous)
+
+    def test_explicit_ieee_convolution_falls_back_only_where_templates_use_tf32(self):
+        def conv(x, w):
+            return torch._convolution(
+                x, w, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1,
+                False, False, True, False,
+            )  # fmt: skip
+
+        x, w = torch.randn(1, 4, 8, 8), torch.randn(4, 4, 3, 3)
+        get_interface_for_device("cpu")
+        previous = device_interfaces["cpu"]
+        try:
+            register_interface_for_device("cpu", _MutableConvAllowTf32Interface)
+            for enabled in (True, False):
+                _MutableConvAllowTf32Interface.enabled = enabled
+                torch._dynamo.reset()
+                _, code = run_and_get_code(torch.compile(conv), x, w)
+                self.assertEqual("aten._convolution.default(" in code[0], enabled)
         finally:
             _MutableConvAllowTf32Interface.enabled = False
             register_interface_for_device("cpu", previous)
