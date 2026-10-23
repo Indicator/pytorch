@@ -91,6 +91,36 @@ struct ConstantBufferSet {
   }
 };
 
+// A shared mutex whose waiting exclusive lockers keep new shared lockers out.
+// std::shared_mutex does not promise that, and glibc's prefers readers, so a
+// stream of overlapping shared lockers can starve an exclusive locker forever.
+// An exclusive locker holds turnstile_ while it waits, and every shared locker
+// has to pass through turnstile_.
+class WritePrioritySharedMutex {
+ public:
+  void lock() {
+    std::lock_guard turnstile(turnstile_);
+    mutex_.lock();
+  }
+
+  void unlock() {
+    mutex_.unlock();
+  }
+
+  void lock_shared() {
+    std::lock_guard turnstile(turnstile_);
+    mutex_.lock_shared();
+  }
+
+  void unlock_shared() {
+    mutex_.unlock_shared();
+  }
+
+ private:
+  std::mutex turnstile_;
+  std::shared_mutex mutex_;
+};
+
 class AOTInductorModelContainer {
  public:
   AOTInductorModelContainer(
@@ -964,7 +994,7 @@ class AOTInductorModelContainer {
   // We acquire the mutex in unique mode when we want exclusive access of the
   // model. One such case is when we want to do a weight swapping. We want to
   // make sure no one is executing the model.
-  std::shared_mutex model_exec_mutex_;
+  WritePrioritySharedMutex model_exec_mutex_;
 };
 
 } // namespace torch::aot_inductor
