@@ -3537,6 +3537,24 @@ class SymmMemCleanupTest(TestCase):
             env_overrides={"TORCH_SYMM_MEM_DISABLE_MULTICAST": "1"},
         )
 
+    def test_free_releases_virtual_address_range(self, device):
+        # The address passed to cuMemAddressReserve is only a hint, so reserving
+        # at a freed block's base lands there only if free() released the range.
+        self._run_cleanup(
+            device,
+            "CUDA",
+            """
+            from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+
+            base, size = _check_cuda_bindings(drv.cuMemGetAddressRange(tensor.data_ptr()))
+            del tensor
+            torch.cuda.synchronize(device)
+            ptr = _check_cuda_bindings(drv.cuMemAddressReserve(size, 0, base, 0))
+            _check_cuda_bindings(drv.cuMemAddressFree(ptr, size))
+            test.assertEqual(int(ptr), int(base))
+            """,
+        )
+
     def _run_cleanup(self, device, backend, body, env_overrides=None):
         if backend == "NCCL" and (
             not dist.is_nccl_available() or torch.cuda.nccl.version() < (2, 27, 0)
