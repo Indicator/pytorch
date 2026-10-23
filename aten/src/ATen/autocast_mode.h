@@ -21,6 +21,11 @@ TORCH_API int increment_nesting();
 TORCH_API int decrement_nesting();
 TORCH_API bool is_autocast_cache_enabled();
 TORCH_API void set_autocast_cache_enabled(bool enabled);
+TORCH_API Tensor binary_cross_entropy_banned(
+    const Tensor&,
+    const Tensor&,
+    const std::optional<Tensor>&,
+    int64_t);
 
 // deprecated CUDA-specific autocast APIs
 C10_DEPRECATED_MESSAGE(
