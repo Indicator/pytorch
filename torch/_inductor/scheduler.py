@@ -3857,14 +3857,19 @@ class SchedulerNode(BaseSchedulerNode):
         fake_deps: OrderedSet[Dep] = OrderedSet(
             dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep))
         )
+        fake_writes: OrderedSet[Dep] = OrderedSet(
+            dep for dep in self.read_writes.writes if isinstance(dep, StarDep)
+        )
         self._compute_attrs(
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
-        if fake_deps or self.mutation_renames:
+        if fake_deps or fake_writes or self.mutation_renames:
             read_writes = self.read_writes
             if fake_deps:
                 read_writes = read_writes.with_read(fake_deps)
+            if fake_writes:
+                read_writes = read_writes.with_write(fake_writes)
             self.set_read_writes(read_writes.rename(self.mutation_renames))
 
     def refresh_dependencies(
@@ -3875,6 +3880,9 @@ class SchedulerNode(BaseSchedulerNode):
         fake_deps: OrderedSet[Dep] = OrderedSet(
             dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep))
         )
+        fake_writes: OrderedSet[Dep] = OrderedSet(
+            dep for dep in self.read_writes.writes if isinstance(dep, StarDep)
+        )
 
         # don't normalize since the loop order may need to be further changed
         # later
@@ -3883,6 +3891,7 @@ class SchedulerNode(BaseSchedulerNode):
                 self._body, *self._sizes, normalize=normalize
             )
             .with_read(fake_deps)
+            .with_write(fake_writes)
             .rename(self.mutation_renames)
         )
 
@@ -6673,6 +6682,21 @@ class Scheduler:
                                 )
                             )
                             add_user(other_name, node, is_weak=True)
+
+            # A cat input realized into a NonOwningLayout view writes the
+            # ConcatKernel buffer in place. StarDep so that fusion never treats
+            # this write as satisfying a MemoryDep read of the cat buffer.
+            cat_writes = OrderedSet[Dep]()
+            for buf in node.get_outputs():
+                layout = buf.node.layout
+                if not isinstance(layout, ir.NonOwningLayout):
+                    continue
+                cat_name = layout.view.get_name()
+                cat_buf = self.name_to_buf.get(cat_name)
+                if cat_buf is not None and isinstance(cat_buf.node, ir.ConcatKernel):
+                    cat_writes.add(StarDep(cat_name))
+            if cat_writes:
+                node.set_read_writes(node.read_writes.with_write(cat_writes))
 
             for add_dep in V.graph.additional_buffer_deps[node.get_name()]:
                 add_user(add_dep, node, is_weak=True)
@@ -12036,13 +12060,33 @@ class Scheduler:
 
             return False
 
-        for partition, skip_cudagraph in zip(
-            reversed(partitions), reversed(skip_cudagraphs)
+        # A buffer is defined (allocated and returned) by the first partition that
+        # writes it. This is usually its producer's partition, but cat inputs are
+        # written in place into the cat buffer before the ConcatKernel node.
+        first_writer: dict[str, int] = {}
+        for idx, partition in enumerate(partitions):
+            for node in partition:
+                for name in _real_dep_names(node.read_writes.writes):
+                    if name in self.name_to_buf:
+                        first_writer.setdefault(name, idx)
+        first_written: list[OrderedSet[str]] = [OrderedSet() for _ in partitions]
+        for name, idx in first_writer.items():
+            first_written[idx].add(name)
+
+        for idx, partition, skip_cudagraph in zip(
+            reversed(range(len(partitions))),
+            reversed(partitions),
+            reversed(skip_cudagraphs),
         ):
             output_names: OrderedSet[str] = OrderedSet()
 
             for node in partition:
                 output_names.update(node.outputs_by_name.keys())
+
+            for name in list(output_names):
+                if first_writer.get(name, idx) != idx:
+                    output_names.remove(name)
+            output_names.update(first_written[idx])
 
             returned_output_names = output_names.intersection(unmet_output_names)
 

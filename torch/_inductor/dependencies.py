@@ -518,6 +518,15 @@ class ReadWrites:
             self.var_ranges,
         )
 
+    def with_write(self, deps: OrderedSet[Dep]) -> "ReadWrites":
+        return ReadWrites(
+            self.reads,
+            OrderedSet.union(self.writes, deps),
+            self.index_exprs,
+            self.range_vars,
+            self.var_ranges,
+        )
+
     def merge(self, other: "ReadWrites") -> "ReadWrites":
         reads = OrderedSet.union(self.reads, other.reads)
         writes = OrderedSet.union(self.writes, other.writes)
